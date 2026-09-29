@@ -5,7 +5,7 @@
 # Docker Compose: docker-compose.yml
 #----------------------------------------------
 
-This is my setup, yours may need tweeking.
+This is my setup, yours may need tweaking.
 I am using a AMD Ryzen 7, 16G VRam, 8G System Ram
 Running:
 Docker / Ollama / open-webui

@@ -2,11 +2,10 @@
 # AI Server Setup
 #-------------------------------------------------------
 
-This is my setup, Yours may need tweeking.
-Info is just for referance.
+This is my setup, Yours may need tweaking.
+Info is just for reference.
 
-#-------------------------------------------------------
-#
+######
 
 AMD Ryzen 7 5700U with Radeon Graphics
 
