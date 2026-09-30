@@ -1,6 +1,7 @@
 @tool
 extends PanelContainer
 # res://addons/godot_bridge/dock.gd
+# Version 2.2.1
 
 var bridge  # reference to the EditorPlugin instance (godot_bridge/plugin.gd)
 
