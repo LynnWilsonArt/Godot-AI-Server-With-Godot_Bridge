@@ -1,311 +1,397 @@
 """
-title: Godot Bridge Tool
-author: Open WebUI
-version: 2.2.1
-license: MIT
-Tool name: Godot_Bridge
-description: Inspect and control an open Godot Engine project through the Godot Bridge plugin.
+title: Godot Bridge
+author: lynn
+description: Full tool set for the Godot Bridge editor plugin (plugin.gd 2.3.x). Parameter names match the plugin's payload keys exactly.
+version: 2.2.0
+requirements: requests
 """
 
 import json
-import urllib.error
-import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Optional
+
+import requests
 from pydantic import BaseModel, Field
 
 
 class Tools:
     class Valves(BaseModel):
-        GODOT_BRIDGE_URL: str = Field(
-            default="http://192.168.1.99:9090",
-            description="Base HTTP URL where the Godot Bridge plugin server is listening.",
+        BRIDGE_URL: str = Field(
+            default="http://192.168.1.100:9090",
+            description="Godot Bridge address as seen from the Open WebUI container. Use the desktop's LAN IP, not localhost.",
         )
-        AUTH_TOKEN: str = Field(
-            default="",
-            description="Bearer token from the Godot Bridge dock. Set it here in Valves, not in code.",
+        AUTH_TOKEN: str = Field(default="", description="Token shown in the Godot Bridge dock.")
+        TIMEOUT_SECONDS: int = Field(default=15, description="HTTP timeout per call.")
+        MAX_RESULT_CHARS: int = Field(
+            default=12000,
+            description="Truncate results to protect the model's context window.",
         )
-        TIMEOUT_SECONDS: int = Field(
-            default=10,
-            description="HTTP timeout for each bridge call.",
+        ALLOW_DELETE: bool = Field(
+            default=False,
+            description="Allow delete_file and remove_node. Off by default.",
         )
 
     def __init__(self):
         self.valves = self.Valves()
+        self.citation = False
 
     # ------------------------------------------------------------------
-    # Internal helpers (underscore names are NOT exposed as tools)
+    # internals
     # ------------------------------------------------------------------
 
-    def _send_command(
-        self, command: str, payload: Optional[Dict[str, Any]] = None
-    ) -> str:
-        """Send a command to the Godot Bridge and return the raw JSON reply."""
-        url = self.valves.GODOT_BRIDGE_URL.rstrip("/")
-        data = json.dumps({"command": command, "payload": payload or {}}).encode(
-            "utf-8"
-        )
-
-        headers = {"Content-Type": "application/json; charset=utf-8"}
-        token = self.valves.AUTH_TOKEN.strip()
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-
+    def _call(self, command: str, payload: Optional[dict] = None) -> str:
+        url = self.valves.BRIDGE_URL.rstrip("/")
+        headers = {"Content-Type": "application/json"}
+        if self.valves.AUTH_TOKEN:
+            headers["Authorization"] = "Bearer " + self.valves.AUTH_TOKEN
+        body = {"command": command, "payload": payload or {}}
         try:
-            with urllib.request.urlopen(
-                req, timeout=self.valves.TIMEOUT_SECONDS
-            ) as response:
-                return response.read().decode("utf-8")
-        except urllib.error.HTTPError as e:
-            try:
-                return e.read().decode("utf-8")
-            except Exception:
-                return json.dumps(
-                    {"ok": False, "error": f"HTTP Error {e.code}: {e.reason}"}
-                )
-        except urllib.error.URLError as e:
+            r = requests.post(
+                url, json=body, headers=headers, timeout=self.valves.TIMEOUT_SECONDS
+            )
+        except requests.exceptions.ConnectionError:
             return json.dumps(
                 {
                     "ok": False,
-                    "error": f"Connection error: {e.reason}. Ensure Godot is running with Godot Bridge active.",
+                    "error": "Cannot reach the Godot Bridge at %s. Godot may be closed, the server may not be started in the dock, or a firewall is blocking the port." % url,
                 }
             )
-        except Exception as e:
-            return json.dumps({"ok": False, "error": str(e)})
+        except requests.exceptions.Timeout:
+            return json.dumps({"ok": False, "error": "Godot Bridge timed out."})
+        except Exception as e:  # noqa: BLE001
+            return json.dumps({"ok": False, "error": "Bridge call failed: %s" % e})
+
+        text = r.text
+        limit = self.valves.MAX_RESULT_CHARS
+        if len(text) > limit:
+            text = (
+                text[:limit]
+                + '... [truncated by the tool; ask for a narrower result (smaller max_depth, filter, offset/limit)]'
+            )
+        return text
 
     @staticmethod
-    def _parse_value(value: Any) -> Any:
-        """Accept JSON text like '[100, 200]' or 'true' and turn it into real JSON values."""
-        if isinstance(value, str):
-            try:
-                return json.loads(value)
-            except (ValueError, TypeError):
-                return value
-        return value
+    def _p(**kwargs) -> dict:
+        return {k: v for k, v in kwargs.items() if v is not None}
+
+    def _blocked(self, what: str) -> str:
+        return json.dumps(
+            {
+                "ok": False,
+                "error": "%s is disabled. The user can enable ALLOW_DELETE in this tool's settings." % what,
+            }
+        )
 
     # ------------------------------------------------------------------
-    # Discovery
+    # read-only
     # ------------------------------------------------------------------
 
     def ping(self) -> str:
         """
-        Check the connection to Godot. Returns the project name and Godot version.
+        Check that the Godot Bridge is reachable. Returns project name and Godot version.
         """
-        return self._send_command("ping")
+        return self._call("ping")
 
     def get_commands(self) -> str:
         """
-        List every bridge command and whether it is enabled (true) or disabled (false) in the Godot plugin.
-        Call this if a tool returns 'Command disabled'.
+        List every bridge command, whether it is enabled, and its exact payload keys.
         """
-        return self._send_command("get_commands")
+        return self._call("get_commands")
 
-    # ------------------------------------------------------------------
-    # Scene inspection (read-only)
-    # ------------------------------------------------------------------
-
-    def get_scene_tree(self) -> str:
+    def get_scene_tree(self, max_depth: int = 4) -> str:
         """
-        Get the node hierarchy of the scene currently open in the Godot editor, with node names, types, and attached scripts.
+        Get the node tree of the scene open in the editor. Each node has name, type, path (use as node_path) and script.
+        :param max_depth: How many levels deep to return.
         """
-        return self._send_command("get_scene_tree")
+        return self._call("get_scene_tree", self._p(max_depth=max_depth))
 
     def get_selected_nodes(self) -> str:
         """
-        Get the nodes currently selected in the open scene.
+        Get the nodes currently selected in the editor.
         """
-        return self._send_command("get_selected_nodes")
+        return self._call("get_selected_nodes")
 
-    def get_node_properties(self, node_path: Optional[str] = None) -> str:
+    def get_node_properties(
+        self, node_path: str, filter_text: Optional[str] = None
+    ) -> str:
         """
-        Get the inspector properties of a node.
-
-        :param node_path: Node path relative to the scene root (e.g. 'Player' or 'World/Enemy'). Use '.' for the root. If omitted, uses the current selection.
+        Get editor properties of a node.
+        :param node_path: Node path from get_scene_tree. Use "." for the scene root.
+        :param filter_text: Only return properties whose name contains this text.
         """
-        payload = {}
-        if node_path:
-            payload["node_path"] = node_path
-        return self._send_command("get_node_properties", payload)
+        return self._call(
+            "get_node_properties", self._p(node_path=node_path, filter=filter_text)
+        )
 
-    def get_node_signals(self, node_path: Optional[str] = None) -> str:
+    def get_node_signals(self, node_path: str, connected_only: bool = False) -> str:
         """
-        List the signals of a node and what each one is connected to.
-
-        :param node_path: Node path relative to the scene root. If omitted, uses the current selection.
+        Get a node's signals and their connections.
+        :param node_path: Node path from get_scene_tree.
+        :param connected_only: Only return signals that have connections.
         """
-        payload = {}
-        if node_path:
-            payload["node_path"] = node_path
-        return self._send_command("get_node_signals", payload)
+        return self._call(
+            "get_node_signals",
+            self._p(node_path=node_path, connected_only=connected_only),
+        )
 
-    # ------------------------------------------------------------------
-    # Files (read_file and list_dir are read-only; write_file changes files)
-    # ------------------------------------------------------------------
-
-    def list_dir(self, path: str = "res://") -> str:
+    def get_open_scenes(self) -> str:
         """
-        List files and folders inside a project directory.
-
-        :param path: Directory path (defaults to 'res://').
+        List the scene files currently open in the editor.
         """
-        return self._send_command("list_dir", {"path": path})
+        return self._call("get_open_scenes")
 
-    def read_file(self, path: str) -> str:
+    def read_file(self, path: str, offset: int = 0, limit: int = 8000) -> str:
         """
-        Read the text contents of a file in the Godot project.
+        Read a project file as text. Long files are paged; check the truncated field and read the rest with offset.
+        :param path: File path such as res://scripts/player.gd.
+        :param offset: Character offset to start reading from.
+        :param limit: Maximum characters to return.
+        """
+        return self._call("read_file", self._p(path=path, offset=offset, limit=limit))
 
-        :param path: File path, e.g. 'res://scripts/player.gd'.
+    def list_dir(self, path: str = "res://", recursive: bool = False) -> str:
         """
-        return self._send_command("read_file", {"path": path})
+        List files and folders in a project directory.
+        :param path: Directory path, default res://.
+        :param recursive: List nested folders too (capped).
+        """
+        return self._call("list_dir", self._p(path=path, recursive=recursive))
 
     def get_open_script(self) -> str:
         """
-        Get the path and full source of the script currently open in Godot's Script Editor.
+        Get the path and full text of the script currently open in the script editor.
         """
-        return self._send_command("get_open_script")
+        return self._call("get_open_script")
+
+    def get_output(self, max_chars: int = 3000, new_only: bool = True) -> str:
+        """
+        Read the editor Output panel: parse errors, print() output and runtime errors.
+        :param max_chars: Maximum characters to return (most recent text).
+        :param new_only: Only return lines since the last get_output call.
+        """
+        return self._call("get_output", self._p(max_chars=max_chars, new_only=new_only))
+
+    def validate_script(self, path: str) -> str:
+        """
+        Parse-check a .gd file on disk. On failure, call get_output for the exact error message.
+        :param path: Script path such as res://scripts/player.gd.
+        """
+        return self._call("validate_script", self._p(path=path))
+
+    def class_info(self, class_name: str, filter_text: Optional[str] = None) -> str:
+        """
+        Get the real methods, properties and signals of a Godot class from the engine. Use this to verify Godot 4.7 APIs.
+        :param class_name: Class name such as CharacterBody2D.
+        :param filter_text: Only return members whose name contains this text.
+        """
+        return self._call(
+            "class_info", self._p(**{"class": class_name, "filter": filter_text})
+        )
+
+    # ------------------------------------------------------------------
+    # files
+    # ------------------------------------------------------------------
 
     def write_file(self, path: str, content: str) -> str:
         """
-        Replace the ENTIRE contents of a project file (creates it if missing). Always send the complete file, never a snippet. Read the file first.
-
-        :param path: Target file path starting with res://.
-        :param content: The complete new file text.
+        Replace the WHOLE file with the given content and create missing folders. Read the file first if it exists.
+        :param path: File path such as res://scripts/player.gd.
+        :param content: The complete new file content.
         """
-        return self._send_command("write_file", {"path": path, "content": content})
+        return self._call("write_file", self._p(path=path, content=content))
+
+    def make_dir(self, path: str) -> str:
+        """
+        Create a directory (and parents) in the project.
+        :param path: Directory path such as res://scripts.
+        """
+        return self._call("make_dir", self._p(path=path))
+
+    def delete_file(self, path: str) -> str:
+        """
+        Delete one project file. Only works if the user enabled ALLOW_DELETE.
+        :param path: File path to delete.
+        """
+        if not self.valves.ALLOW_DELETE:
+            return self._blocked("delete_file")
+        return self._call("delete_file", self._p(path=path))
 
     # ------------------------------------------------------------------
-    # Scene editing (each is undoable in the editor; disabled by default in the plugin)
+    # scene editing
     # ------------------------------------------------------------------
-
-    def set_node_property(
-        self, property: str, value: str, node_path: Optional[str] = None
-    ) -> str:
-        """
-        Set a property on a node.
-
-        :param property: Property name, e.g. 'position', 'visible', 'modulate', 'text'.
-        :param value: New value as JSON text: '[100, 200]' for Vector2, '[1, 0, 0, 1]' for Color, 'true', '42', or plain text for strings.
-        :param node_path: Target node path relative to the scene root. If omitted, uses the current selection.
-        """
-        payload = {"property": property, "value": self._parse_value(value)}
-        if node_path:
-            payload["node_path"] = node_path
-        return self._send_command("set_node_property", payload)
 
     def spawn_node(
         self,
         node_type: str,
-        name: str = "NewNode",
-        parent_node_path: str = ".",
+        name: Optional[str] = None,
+        parent: Optional[str] = None,
+        properties: Optional[dict] = None,
     ) -> str:
         """
-        Create a new node in the open scene.
-
-        :param node_type: Godot class name, e.g. 'Sprite2D', 'Node2D', 'Label', 'CharacterBody2D', 'Timer'.
-        :param name: Name for the new node.
-        :param parent_node_path: Parent node path relative to the scene root. '.' means the scene root.
+        Add a new node to the open scene. Returns its node_path.
+        :param node_type: Node class such as Label or CharacterBody2D.
+        :param name: Node name. Defaults to the type name.
+        :param parent: Parent node_path. Defaults to the scene root.
+        :param properties: Optional properties to set. Vectors and colors as arrays, resources as res:// paths.
         """
-        payload = {
-            "node_type": node_type,
-            "name": name,
-            "parent": parent_node_path or ".",
-        }
-        return self._send_command("spawn_node", payload)
+        return self._call(
+            "spawn_node",
+            self._p(node_type=node_type, name=name, parent=parent, properties=properties),
+        )
 
     def spawn_packed_scene(
         self,
         scene_path: str,
-        name: str = "",
-        parent_node_path: str = ".",
+        name: Optional[str] = None,
+        parent: Optional[str] = None,
+        properties: Optional[dict] = None,
     ) -> str:
         """
-        Instantiate a saved scene file (.tscn) into the open scene.
-
-        :param scene_path: Scene file path, e.g. 'res://enemies/slime.tscn'.
-        :param name: Optional name for the new instance.
-        :param parent_node_path: Parent node path relative to the scene root. '.' means the scene root.
+        Instance a saved scene (.tscn) into the open scene. Returns its node_path.
+        :param scene_path: Scene file such as res://enemies/slime.tscn.
+        :param name: Optional instance name.
+        :param parent: Parent node_path. Defaults to the scene root.
+        :param properties: Optional properties to set on the instance.
         """
-        payload = {
-            "scene_path": scene_path,
-            "parent": parent_node_path or ".",
-        }
-        if name:
-            payload["name"] = name
-        return self._send_command("spawn_packed_scene", payload)
+        return self._call(
+            "spawn_packed_scene",
+            self._p(scene_path=scene_path, name=name, parent=parent, properties=properties),
+        )
 
     def remove_node(self, node_path: str) -> str:
         """
-        Delete a node from the open scene. The scene root cannot be removed.
-
-        :param node_path: Path of the node to delete, relative to the scene root.
+        Remove a node from the open scene. Only works if the user enabled ALLOW_DELETE.
+        :param node_path: Node path from get_scene_tree.
         """
-        return self._send_command("remove_node", {"node_path": node_path})
+        if not self.valves.ALLOW_DELETE:
+            return self._blocked("remove_node")
+        return self._call("remove_node", self._p(node_path=node_path))
 
-    def reparent_node(self, node_path: str, new_parent_path: str) -> str:
+    def reparent_node(self, node_path: str, new_parent: str) -> str:
         """
-        Move a node under a different parent in the open scene.
-
-        :param node_path: Path of the node to move.
-        :param new_parent_path: Path of the new parent ('.' for the scene root).
+        Move a node under a different parent.
+        :param node_path: Node to move.
+        :param new_parent: node_path of the new parent.
         """
-        return self._send_command(
-            "reparent_node",
-            {"target": node_path, "new_parent": new_parent_path},
+        return self._call(
+            "reparent_node", self._p(node_path=node_path, new_parent=new_parent)
         )
 
-    def connect_signal(
+    def rename_node(self, node_path: str, new_name: str) -> str:
+        """
+        Rename a node. Returns the new node_path.
+        :param node_path: Node to rename.
+        :param new_name: New node name.
+        """
+        return self._call("rename_node", self._p(node_path=node_path, new_name=new_name))
+
+    def set_node_property(self, node_path: str, property: str, value: Any) -> str:
+        """
+        Set one property on a node. Vector2/3 and Color as arrays, Color also as a name or #hex, resources as res:// paths. To set a script use attach_script.
+        :param node_path: Node path from get_scene_tree.
+        :param property: Property name, e.g. position or text.
+        :param value: New value.
+        """
+        return self._call(
+            "set_node_property",
+            {"node_path": node_path, "property": property, "value": value},
+        )
+
+    def attach_script(self, node_path: str, script_path: str) -> str:
+        """
+        Attach an existing script to a node. The script must extend the node's type. write_file it first.
+        :param node_path: Node path from get_scene_tree.
+        :param script_path: Script path such as res://scripts/player.gd.
+        """
+        return self._call(
+            "attach_script", self._p(node_path=node_path, script_path=script_path)
+        )
+
+    def add_to_group(self, node_path: str, group: str) -> str:
+        """
+        Add a node to a group.
+        :param node_path: Node path from get_scene_tree.
+        :param group: Group name.
+        """
+        return self._call("add_to_group", self._p(node_path=node_path, group=group))
+
+    def connect_signal(self, source: str, target: str, signal: str, method: str) -> str:
+        """
+        Connect a signal between two nodes. The connection is saved with the scene.
+        :param source: node_path of the node that emits the signal.
+        :param target: node_path of the node that receives it.
+        :param signal: Signal name, e.g. pressed.
+        :param method: Method name on the target node.
+        """
+        return self._call(
+            "connect_signal",
+            self._p(source=source, target=target, signal=signal, method=method),
+        )
+
+    # ------------------------------------------------------------------
+    # scenes and project
+    # ------------------------------------------------------------------
+
+    def create_scene(
         self,
-        source_node_path: str,
-        signal_name: str,
-        target_node_path: str,
-        method_name: str,
+        path: str,
+        root_type: str = "Node2D",
+        root_name: Optional[str] = None,
+        overwrite: bool = False,
     ) -> str:
         """
-        Connect a signal on one node to a method on another node.
-
-        :param source_node_path: Node that emits the signal.
-        :param signal_name: Signal name, e.g. 'pressed' or 'body_entered'.
-        :param target_node_path: Node that receives the signal (must have the method).
-        :param method_name: Method to call on the target node.
+        Create a new .tscn scene with one root node and open it.
+        :param path: Scene path such as res://levels/level1.tscn.
+        :param root_type: Root node class.
+        :param root_name: Root node name. Defaults to the file name in PascalCase.
+        :param overwrite: Replace an existing scene file.
         """
-        return self._send_command(
-            "connect_signal",
-            {
-                "source": source_node_path,
-                "signal": signal_name,
-                "target": target_node_path,
-                "method": method_name,
-            },
+        return self._call(
+            "create_scene",
+            self._p(path=path, root_type=root_type, root_name=root_name, overwrite=overwrite),
         )
-
-    # ------------------------------------------------------------------
-    # Scene and project control (disabled by default in the plugin)
-    # ------------------------------------------------------------------
 
     def save_scene(self) -> str:
         """
-        Save the scene currently open in the editor.
+        Save the scene currently being edited.
         """
-        return self._send_command("save_scene")
+        return self._call("save_scene")
 
     def open_scene(self, path: str) -> str:
         """
         Open a scene file in the editor.
-
-        :param path: Scene path, e.g. 'res://main.tscn'.
+        :param path: Scene path such as res://main.tscn.
         """
-        return self._send_command("open_scene", {"path": path})
+        return self._call("open_scene", self._p(path=path))
+
+    def set_main_scene(self, path: str) -> str:
+        """
+        Set the scene that run_project plays.
+        :param path: Scene path such as res://main.tscn.
+        """
+        return self._call("set_main_scene", self._p(path=path))
+
+    def add_input_action(self, action: str, keys: list) -> str:
+        """
+        Create or replace an input action with the given keys.
+        :param action: Action name such as move_left.
+        :param keys: Key names such as ["A", "Left"].
+        """
+        return self._call("add_input_action", self._p(action=action, keys=keys))
 
     def run_project(self) -> str:
         """
-        Run the project's main scene.
+        Play the project's main scene. Then call get_output to read errors.
         """
-        return self._send_command("run_project")
+        return self._call("run_project")
+
+    def run_current_scene(self) -> str:
+        """
+        Play the scene currently open in the editor. Then call get_output to read errors.
+        """
+        return self._call("run_current_scene")
 
     def stop_project(self) -> str:
         """
-        Stop the running project.
+        Stop the running game.
         """
-        return self._send_command("stop_project")
-
+        return self._call("stop_project")
